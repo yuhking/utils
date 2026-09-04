@@ -1,0 +1,21 @@
+# ビルド生成物
+*.exe
+*.dcu
+*.res
+*.identcache
+*.dsk
+*.~dsk
+*.local
+__history/
+Win32/
+
+# 実行時に生成される設定・ログ・キャッシュ（個人情報を含むため）
+imap_settings.ini
+app.log
+*/scan.tsv
+*/verify_skip.tsv
+*/protected.tsv
+
+# SSLライブラリ（配布ライセンスの都合上リポジトリには含めない）
+libeay32.dll
+ssleay32.dll
