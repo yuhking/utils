@@ -70,6 +70,7 @@ type
     AttachTotalSize: Int64;
     IsProtected: Boolean;      // ユーザーが「消したくない」と保護指定したメール
     MarkedForDelete: Boolean;  // 「メール削除」列でチェックされている（メールごと削除する対象）
+    MarkedForAttachDelete: Boolean; // 「添付削除」列でチェックされている（添付だけ削除する対象）
     Msg: TIdMessage;          // 取得済みメッセージ本体（削除実行時に再利用）
     destructor Destroy; override;
   end;
@@ -166,15 +167,15 @@ type
     btnLanguage: TButton;
     chkAutoConnect: TCheckBox;
     chkAutoList: TCheckBox;
-    btnDeleteMails: TButton;
+    chkAutoVerify: TCheckBox;
     procedure FormCreate(Sender: TObject);
     procedure DoLanguageChange(Sender: TObject);
     procedure DoAutoConnectClick(Sender: TObject);
     procedure DoAutoListClick(Sender: TObject);
+    procedure DoAutoVerifyClick(Sender: TObject);
     procedure FormClose(Sender: TObject; var Action: TCloseAction);
     procedure DoListMails(Sender: TObject);
-    procedure DoUpdateClick(Sender: TObject);
-    procedure DoDeleteMailsClick(Sender: TObject);
+    procedure DoProcessSelectedClick(Sender: TObject);
     procedure DoSaveProfileClick(Sender: TObject);
     procedure DoDeleteProfileClick(Sender: TObject);
     procedure DoConnectClick(Sender: TObject);
@@ -198,6 +199,10 @@ type
     LogFilePath: string; // 実行毎に上書きするログファイル（AIによる調査用）
     FSortColumn: Integer;
     FSortAscending: Boolean;
+    // IMAP接続(FIMAP4)は同時に1つの処理からしか使えない（SSL/TLSストリームが
+    // 壊れるため）。一括削除・単一メール削除・メール削除いずれかがバックグラウンド
+    // スレッドで動いている間は、このフラグで他の削除系操作を一切受け付けない。
+    FNetworkBusy: Boolean;
     // メール閲覧ダイアログの「添付削除」「メール削除」ボタン用（ダイアログはモーダル
     // 1つしか同時に開かないため、対象を一時的にここへ控えておけば十分）
     FViewerUID: Int64;
@@ -205,6 +210,8 @@ type
     FViewerDlg: TForm;
     FViewerBtnDelAttach: TButton;
     FViewerBtnDelMail: TButton;
+    function TryBeginNetworkOp: Boolean;
+    procedure EndNetworkOp;
     procedure DoViewerDeleteAttachClick(Sender: TObject);
     procedure DoViewerDeleteMailClick(Sender: TObject);
     // IMAP通信はバックグラウンドスレッドで行うため、VCLコントロールに触る処理は
@@ -226,6 +233,15 @@ type
     function MoveOrDeleteOriginal(AUID: Int64; const ADeleteFolder: string;
       AIsGmail, AIsSpecialUseFolder: Boolean): Boolean;
     function FindEntryByUID(AUID: Int64): TMailEntry;
+    // 「4. 選択した項目を処理」ボタン用：添付削除対象・メール削除対象をそれぞれ
+    // 処理する。どちらもバックグラウンドスレッドから呼ばれる想定（imapは呼び出し元
+    // が接続・SelectMailBox済みのものを渡す）。
+    procedure ProcessAttachDeleteTargets(AImap: TIdIMAP4Batch; ATargets: TList<TMailEntry>;
+      const ADeleteFolder: string; AIsGmail, AIsSpecialUseFolder, AAutoVerify: Boolean;
+      out ATotalMails, ATotalRemoved: Integer);
+    procedure ProcessMailDeleteTargets(AImap: TIdIMAP4Batch; ATargets: TList<TMailEntry>;
+      const ADeleteFolder: string; AIsGmail, AIsSpecialUseFolder: Boolean;
+      out ATotalDeleted: Integer);
     procedure RemoveAttachmentsForSingleMail(AUID: Int64; const ASubject: string);
     procedure DeleteMailEntirely(AUID: Int64; const ASubject: string);
     // メール本文取得中の進捗(ダウンロード済みバイト数)をプログレスバーに反映する
@@ -255,6 +271,7 @@ type
     procedure SetUIDProtected(AUID: Int64; AProtect: Boolean);
     function ProtectMarkText(AProtected: Boolean): string;
     function DeleteMailMarkText(AMarked: Boolean): string;
+    function AttachDeleteMarkText(AMarked: Boolean): string;
     // 一覧の「保護」「メール削除」列がクリックされたとき、その行のON/OFFを切り替える
     procedure ToggleMarkColumnAtPoint(X, Y: Integer);
     procedure RemoveEntryFromList(AEntry: TMailEntry);
@@ -692,6 +709,7 @@ var
   langCode: string;
   autoConnect: Boolean;
   autoList: Boolean;
+  autoVerify: Boolean;
 begin
   FEntries := TObjectList<TMailEntry>.Create(True);
   FProcessedEntries := TObjectList<TMailEntry>.Create(True);
@@ -707,18 +725,21 @@ begin
   langCode := 'ja';
   autoConnect := False; // 起動時の自動接続は明示的にONにするまでデフォルトでオフ
   autoList := True; // 接続後の自動一覧取得はデフォルトでオン
+  autoVerify := True; // 削除ごとの自動検証はデフォルトでオン
   if FileExists(IniPath) then begin
     langIni := TIniFile.Create(IniPath);
     try
       langCode := langIni.ReadString('Meta', 'Language', ''); {Do not Localize}
       autoConnect := langIni.ReadBool('Meta', 'AutoConnect', False); {Do not Localize}
       autoList := langIni.ReadBool('Meta', 'AutoList', True); {Do not Localize}
+      autoVerify := langIni.ReadBool('Meta', 'AutoVerify', True); {Do not Localize}
     finally
       langIni.Free;
     end;
   end;
   chkAutoConnect.Checked := autoConnect;
   chkAutoList.Checked := autoList;
+  chkAutoVerify.Checked := autoVerify;
   if langCode = '' then begin
     if SysLocale.PriLangID = LANG_JAPANESE then
       langCode := 'ja'
@@ -776,27 +797,28 @@ begin
   btnListFolders.Caption := T('btn.listFolders');
   btnConnect.Caption := T('btn.connect');
   btnList.Caption := T('btn.list');
-  btnUpdate.Caption := T('btn.update');
-  btnDeleteMails.Caption := T('btn.deleteMails');
+  btnUpdate.Caption := T('btn.processSelected');
   btnClearCache.Caption := T('btn.clearCache');
   edtMaxCount.EditLabel.Caption := T('edt.maxCountLabel');
   chkAutoConnect.Caption := T('chk.autoConnect');
   chkAutoList.Caption := T('chk.autoList');
+  chkAutoVerify.Caption := T('chk.autoVerify');
 
   if SameText(CurrentLangCode, 'en') then
     btnLanguage.Caption := '日本語' {Do not Localize}
   else
     btnLanguage.Caption := 'English'; {Do not Localize}
 
-  // 列順: 保護, メール削除, 日付, 差出人, 件名, 添付数, 添付合計サイズ
-  if lvMails.Columns.Count >= 7 then begin
-    lvMails.Columns[0].Caption := T('col.protect');
+  // 列順: 添付削除(標準チェックボックス), メール削除, 保護, 日付, 差出人, 件名, 添付数, 添付合計サイズ
+  if lvMails.Columns.Count >= 8 then begin
+    lvMails.Columns[0].Caption := T('col.attachDelete');
     lvMails.Columns[1].Caption := T('col.deleteMail');
-    lvMails.Columns[2].Caption := T('col.date');
-    lvMails.Columns[3].Caption := T('col.from');
-    lvMails.Columns[4].Caption := T('col.subject');
-    lvMails.Columns[5].Caption := T('col.attachCount');
-    lvMails.Columns[6].Caption := T('col.attachSize');
+    lvMails.Columns[2].Caption := T('col.protect');
+    lvMails.Columns[3].Caption := T('col.date');
+    lvMails.Columns[4].Caption := T('col.from');
+    lvMails.Columns[5].Caption := T('col.subject');
+    lvMails.Columns[6].Caption := T('col.attachCount');
+    lvMails.Columns[7].Caption := T('col.attachSize');
   end;
 end;
 
@@ -848,6 +870,36 @@ begin
       ini.Free;
     end;
   end;
+end;
+
+procedure TForm1.DoAutoVerifyClick(Sender: TObject);
+var
+  ini: TIniFile;
+begin
+  if IniPath <> '' then begin
+    ini := TIniFile.Create(IniPath);
+    try
+      ini.WriteBool('Meta', 'AutoVerify', chkAutoVerify.Checked); {Do not Localize}
+    finally
+      ini.Free;
+    end;
+  end;
+end;
+
+{ FIMAP4への同時アクセスを防ぐためのロック。取得できなければFalseを返すので、
+  呼び出し側は「他の処理が実行中です」と表示してExitする。 }
+function TForm1.TryBeginNetworkOp: Boolean;
+begin
+  Result := not FNetworkBusy;
+  if Result then
+    FNetworkBusy := True
+  else
+    ShowMessage(T('msg.networkBusy'));
+end;
+
+procedure TForm1.EndNetworkOp;
+begin
+  FNetworkBusy := False;
 end;
 
 function TForm1.ConfirmBulkWarningIfNeeded(ACount: Integer): Boolean;
@@ -989,9 +1041,10 @@ begin
       FProcessedEntries.Add(AEntry);
       for j := 0 to lvMails.Items.Count - 1 do begin
         if lvMails.Items[j].Data = AEntry then begin
-          // 件名列(SubItems[3]: 保護/メール削除/日付/差出人 の次)に[済]を付ける
-          lvMails.Items[j].SubItems[3] := T('note.processedPrefix') + ' ' + lvMails.Items[j].SubItems[3];
-          lvMails.Items[j].Checked := False;
+          // 件名列(SubItems[4]: 保護/メール削除/日付/差出人 の次)に[済]を付ける
+          lvMails.Items[j].SubItems[4] := T('note.processedPrefix') + ' ' + lvMails.Items[j].SubItems[4];
+          AEntry.MarkedForAttachDelete := False;
+          lvMails.Items[j].Caption := AttachDeleteMarkText(False);
           Break;
         end;
       end;
@@ -1118,15 +1171,16 @@ var
 begin
   e1 := TMailEntry(Item1.Data);
   e2 := TMailEntry(Item2.Data);
-  // 列順: 保護, メール削除, 日付, 差出人, 件名, 添付数, 添付合計サイズ
+  // 列順: 添付削除(標準チェックボックス), メール削除, 保護, 日付, 差出人, 件名, 添付数, 添付合計サイズ
   case Data of
-    0: Compare := Ord(e1.IsProtected) - Ord(e2.IsProtected);
+    0: Compare := Ord(e1.MarkedForAttachDelete) - Ord(e2.MarkedForAttachDelete);
     1: Compare := Ord(e1.MarkedForDelete) - Ord(e2.MarkedForDelete);
-    2: Compare := CompareText(Item1.SubItems[1], Item2.SubItems[1]); // 日付（yyyy/mm/dd hh:nn形式なので文字列比較で正しい順になる）
-    3: Compare := CompareText(e1.From, e2.From);
-    4: Compare := CompareText(e1.Subject, e2.Subject);
-    5: Compare := e1.AttachCount - e2.AttachCount;
-    6: // 添付合計サイズ
+    2: Compare := Ord(e1.IsProtected) - Ord(e2.IsProtected);
+    3: Compare := CompareText(Item1.SubItems[2], Item2.SubItems[2]); // 日付（yyyy/mm/dd hh:nn形式なので文字列比較で正しい順になる）
+    4: Compare := CompareText(e1.From, e2.From);
+    5: Compare := CompareText(e1.Subject, e2.Subject);
+    6: Compare := e1.AttachCount - e2.AttachCount;
+    7: // 添付合計サイズ
       begin
         if e1.AttachTotalSize < e2.AttachTotalSize then Compare := -1
         else if e1.AttachTotalSize > e2.AttachTotalSize then Compare := 1
@@ -1218,7 +1272,7 @@ end;
 
 { 指定UIDの元メールを、移動先フォルダへ退避（またはADeleteFolder=''なら削除）する。
   Gmailの通常ラベルの場合はラベル操作、それ以外はCOPY+DELETEを使う
-  （DoUpdateClickと同じ考え方）。 }
+  （DoProcessSelectedClickと同じ考え方）。 }
 function TForm1.MoveOrDeleteOriginal(AUID: Int64; const ADeleteFolder: string;
   AIsGmail, AIsSpecialUseFolder: Boolean): Boolean;
 var
@@ -1300,6 +1354,8 @@ begin
       Exit;
   end;
 
+  if not TryBeginNetworkOp then Exit;
+
   Screen.Cursor := crHourGlass;
   if Assigned(FViewerBtnDelAttach) then FViewerBtnDelAttach.Enabled := False;
   if Assigned(FViewerBtnDelMail) then FViewerBtnDelMail.Enabled := False;
@@ -1374,6 +1430,7 @@ begin
           ResetProgress;
           if Assigned(FViewerBtnDelAttach) then FViewerBtnDelAttach.Enabled := True;
           if Assigned(FViewerBtnDelMail) then FViewerBtnDelMail.Enabled := True;
+          EndNetworkOp;
 
           if errMsg <> '' then begin
             ShowMessage(errMsg);
@@ -1390,9 +1447,10 @@ begin
 
           for i := 0 to lvMails.Items.Count - 1 do begin
             if Assigned(lvMails.Items[i].Data) and (TMailEntry(lvMails.Items[i].Data).UID = AUID) then begin
-              // 件名列(SubItems[3])に[済]を付ける
-              lvMails.Items[i].SubItems[3] := T('note.processedPrefix') + ' ' + lvMails.Items[i].SubItems[3];
-              lvMails.Items[i].Checked := False;
+              // 件名列(SubItems[4])に[済]を付ける
+              lvMails.Items[i].SubItems[4] := T('note.processedPrefix') + ' ' + lvMails.Items[i].SubItems[4];
+              entryObj.MarkedForAttachDelete := False;
+              lvMails.Items[i].Caption := AttachDeleteMarkText(False);
               Break;
             end;
           end;
@@ -1427,6 +1485,8 @@ begin
   else
     confirmMsg := Format(T('msg.deleteMailConfirmNoMove'), [ASubject]);
   if MessageDlg(confirmMsg, mtWarning, [mbYes, mbNo], 0) <> mrYes then Exit;
+
+  if not TryBeginNetworkOp then Exit;
 
   Screen.Cursor := crHourGlass;
   if Assigned(FViewerBtnDelAttach) then FViewerBtnDelAttach.Enabled := False;
@@ -1484,6 +1544,7 @@ begin
           ResetProgress;
           if Assigned(FViewerBtnDelAttach) then FViewerBtnDelAttach.Enabled := True;
           if Assigned(FViewerBtnDelMail) then FViewerBtnDelMail.Enabled := True;
+          EndNetworkOp;
 
           if errMsg <> '' then begin
             ShowMessage(errMsg);
@@ -1635,48 +1696,60 @@ begin
 end;
 
 { ダブルクリックでそのメールの本文を取得して表示する（読み取り専用。チェックは変更しない）。 }
+{ ダブルクリックでそのメールの本文を取得して表示する（読み取り専用。チェックは変更しない）。
+  本文取得(FIMAP4を使う区間)だけをロックで保護する。ダイアログ内の
+  「添付ファイルを削除」「メールを削除」ボタンは、押された時点で
+  RemoveAttachmentsForSingleMail/DeleteMailEntirelyが自分でロックを取り直すので、
+  ダイアログを表示している間までロックを持ち続ける必要はない（むしろ持ち続けると
+  同じスレッドからの再ロックで自分自身をブロックしてしまう）。 }
 procedure TForm1.DoMailsDblClick(Sender: TObject);
 var
   entry: TMailEntry;
   msg: TIdMessage;
+  fetchOK: Boolean;
 begin
   if not Assigned(lvMails.Selected) then Exit;
   entry := TMailEntry(lvMails.Selected.Data);
   if entry = nil then Exit;
 
+  if not TryBeginNetworkOp then Exit;
+  fetchOK := False;
+  msg := TIdMessage.Create(nil);
   try
-    EnsureConnected;
-  except
-    on E: Exception do begin
-      ShowMessage(E.Message);
-      Exit;
+    try
+      EnsureConnected;
+    except
+      on E: Exception do begin
+        ShowMessage(E.Message);
+        Exit;
+      end;
     end;
-  end;
 
-  Screen.Cursor := crHourGlass;
-  FIMAP4.OnWorkBegin := DoFetchWorkBegin;
-  FIMAP4.OnWork := DoFetchWork;
-  FIMAP4.OnWorkEnd := DoFetchWorkEnd;
-  try
-    msg := TIdMessage.Create(nil);
+    Screen.Cursor := crHourGlass;
+    FIMAP4.OnWorkBegin := DoFetchWorkBegin;
+    FIMAP4.OnWork := DoFetchWork;
+    FIMAP4.OnWorkEnd := DoFetchWorkEnd;
     try
       // UIDRetrieve(非Peek)はRFC822形式でのFETCHとなり、Gmail相手だと応答の
       // パース失敗でOKなのにFalseが返ることがあったため、より安定するBODY.PEEK[]
       // 形式のUIDRetrievePeekを使う（\Seenも変化しないので閲覧用途にも合う）。
-      if not FIMAP4.UIDRetrievePeek(IntToStr(entry.UID), msg) then begin
-        Log(Format(T('msg.bodyFetchFailed'), [entry.UID, FIMAP4.GetLastReplyText]));
-        Exit;
-      end;
-      ShowMailContentDialog(entry.UID, msg, entry.Subject);
+      if not FIMAP4.UIDRetrievePeek(IntToStr(entry.UID), msg) then
+        Log(Format(T('msg.bodyFetchFailed'), [entry.UID, FIMAP4.GetLastReplyText]))
+      else
+        fetchOK := True;
     finally
-      msg.Free;
+      FIMAP4.OnWorkBegin := nil;
+      FIMAP4.OnWork := nil;
+      FIMAP4.OnWorkEnd := nil;
+      Screen.Cursor := crDefault;
     end;
   finally
-    FIMAP4.OnWorkBegin := nil;
-    FIMAP4.OnWork := nil;
-    FIMAP4.OnWorkEnd := nil;
-    Screen.Cursor := crDefault;
+    EndNetworkOp;
   end;
+
+  if fetchOK then
+    ShowMailContentDialog(entry.UID, msg, entry.Subject);
+  msg.Free;
 end;
 
 { 右クリックでその行の件名をクリップボードへコピーする。 }
@@ -2056,81 +2129,98 @@ var
   name: string;
   currentText, currentDeleteText: string;
 begin
-  Screen.Cursor := crHourGlass;
+  if not TryBeginNetworkOp then Exit;
   try
+    Screen.Cursor := crHourGlass;
     try
-      EnsureLoggedIn;
-
-      currentText := cboFolder.Text;
-      currentDeleteText := cboDeleteFolder.Text;
-      sl := TStringList.Create;
       try
-        FIMAP4.ListMailBoxes(sl);
+        EnsureLoggedIn;
 
-        cboFolder.Items.Clear;
-        cboDeleteFolder.Items.Clear;
-        for i := 0 to sl.Count - 1 do begin
-          name := ExtractMailboxName(sl[i]);
-          if (name <> '') and (cboFolder.Items.IndexOf(name) < 0) then begin
-            cboFolder.Items.Add(name);
-            cboDeleteFolder.Items.Add(name);
+        currentText := cboFolder.Text;
+        currentDeleteText := cboDeleteFolder.Text;
+        sl := TStringList.Create;
+        try
+          FIMAP4.ListMailBoxes(sl);
+
+          cboFolder.Items.Clear;
+          cboDeleteFolder.Items.Clear;
+          for i := 0 to sl.Count - 1 do begin
+            name := ExtractMailboxName(sl[i]);
+            if (name <> '') and (cboFolder.Items.IndexOf(name) < 0) then begin
+              cboFolder.Items.Add(name);
+              cboDeleteFolder.Items.Add(name);
+            end;
           end;
+        finally
+          sl.Free;
         end;
-      finally
-        sl.Free;
+
+        cboFolder.Text := currentText; // 選択操作でユーザー入力が消えないように
+        cboDeleteFolder.Text := currentDeleteText;
+
+        if cboFolder.Items.Count = 0 then
+          Log(T('msg.foldersFailed'))
+        else
+          Log(Format(T('msg.foldersFetched'), [cboFolder.Items.Count]));
+      except
+        on E: Exception do
+          Log(Format(T('msg.foldersFetchFailed'), [E.Message]));
       end;
-
-      cboFolder.Text := currentText; // 選択操作でユーザー入力が消えないように
-      cboDeleteFolder.Text := currentDeleteText;
-
-      if cboFolder.Items.Count = 0 then
-        Log(T('msg.foldersFailed'))
-      else
-        Log(Format(T('msg.foldersFetched'), [cboFolder.Items.Count]));
-    except
-      on E: Exception do
-        Log(Format(T('msg.foldersFetchFailed'), [E.Message]));
+    finally
+      Screen.Cursor := crDefault;
     end;
   finally
-    Screen.Cursor := crDefault;
+    EndNetworkOp;
   end;
 end;
 
 procedure TForm1.DoConnectClick(Sender: TObject);
+var
+  doAutoList: Boolean;
 begin
-  Screen.Cursor := crHourGlass;
+  if not TryBeginNetworkOp then Exit;
+  doAutoList := False;
   try
+    Screen.Cursor := crHourGlass;
     try
-      if FIMAP4.Connected then
-        FIMAP4.Disconnect;
+      try
+        if FIMAP4.Connected then
+          FIMAP4.Disconnect;
 
-      EnsureLoggedIn;
+        EnsureLoggedIn;
 
-      if not FIMAP4.SelectMailBox(FolderName) then begin
-        Log(T('msg.folderSelectFailed'));
-        Exit;
+        if not FIMAP4.SelectMailBox(FolderName) then begin
+          Log(T('msg.folderSelectFailed'));
+          Exit;
+        end;
+
+        // 接続に成功した内容を、コンボボックスに入っている名前でプロファイル保存
+        if Trim(cboProfile.Text) <> '' then begin
+          SaveProfileFields(Trim(cboProfile.Text));
+          SaveLastProfile(Trim(cboProfile.Text));
+        end;
+
+        lblStatus.Caption := Format(T('msg.connected'), [FIMAP4.Host, FIMAP4.MailBox.TotalMsgs]);
+        Log(Format(T('msg.connectedLog'), [FIMAP4.Host, FolderName]));
+        btnList.Enabled := True;
+
+        // 接続に成功したら、「接続後に自動で一覧取得する」がONのときだけ続けて実行
+        // （DoListMails自体もロックを取るため、ここでは呼ばずフラグだけ立てて、
+        //   ロックを解放してから呼び出す）
+        doAutoList := chkAutoList.Checked;
+      except
+        on E: Exception do
+          Log(Format(T('msg.connectFailed'), [E.Message]));
       end;
-
-      // 接続に成功した内容を、コンボボックスに入っている名前でプロファイル保存
-      if Trim(cboProfile.Text) <> '' then begin
-        SaveProfileFields(Trim(cboProfile.Text));
-        SaveLastProfile(Trim(cboProfile.Text));
-      end;
-
-      lblStatus.Caption := Format(T('msg.connected'), [FIMAP4.Host, FIMAP4.MailBox.TotalMsgs]);
-      Log(Format(T('msg.connectedLog'), [FIMAP4.Host, FolderName]));
-      btnList.Enabled := True;
-
-      // 接続に成功したら、「接続後に自動で一覧取得する」がONのときだけ続けて実行
-      if chkAutoList.Checked then
-        DoListMails(Sender);
-    except
-      on E: Exception do
-        Log(Format(T('msg.connectFailed'), [E.Message]));
+    finally
+      Screen.Cursor := crDefault;
     end;
   finally
-    Screen.Cursor := crDefault;
+    EndNetworkOp;
   end;
+
+  if doAutoList then
+    DoListMails(Sender);
 end;
 
 const
@@ -2277,7 +2367,17 @@ begin
     Result := '';
 end;
 
-{ 一覧の「保護」「メール削除」列（末尾2列）がクリックされた行のON/OFFを切り替える。
+function TForm1.AttachDeleteMarkText(AMarked: Boolean): string;
+begin
+  if AMarked then
+    Result := '✓' {Do not Localize}
+  else
+    Result := '';
+end;
+
+{ 一覧の「添付削除」「メール削除」「保護」列（先頭3列）がクリックされた行のON/OFFを
+  切り替える。3列ともクリックした場所で反応する統一的な挙動にするため、標準の
+  TListView.Checkboxesは使わず、他の2列と同じテキストマーク方式にしている。
   列の境界はColumns[i].Widthの累積で概算する（横スクロールしていない前提）。 }
 procedure TForm1.ToggleMarkColumnAtPoint(X, Y: Integer);
 var
@@ -2285,17 +2385,18 @@ var
   entry: TMailEntry;
   colStart: Integer;
   i, colIndex: Integer;
-  protectColIndex, deleteMailColIndex: Integer;
+  attachDeleteColIndex, protectColIndex, deleteMailColIndex: Integer;
 begin
-  if lvMails.Columns.Count < 7 then Exit;
+  if lvMails.Columns.Count < 8 then Exit;
   item := lvMails.GetItemAt(X, Y);
   if item = nil then Exit;
   entry := TMailEntry(item.Data);
   if entry = nil then Exit;
 
-  // 列順: 保護(0), メール削除(1), 日付, 差出人, 件名, 添付数, 添付合計サイズ
-  protectColIndex := 0;
+  // 列順: 添付削除(0), メール削除(1), 保護(2), 日付, 差出人, 件名, 添付数, 添付合計サイズ
+  attachDeleteColIndex := 0;
   deleteMailColIndex := 1;
+  protectColIndex := 2;
 
   colIndex := -1;
   colStart := 0;
@@ -2307,13 +2408,19 @@ begin
     colStart := colStart + lvMails.Columns[i].Width;
   end;
 
-  if colIndex = protectColIndex then begin
+  if colIndex = attachDeleteColIndex then begin
+    if entry.IsProtected then Exit; // 保護中は「添付削除」を付けさせない
+    entry.MarkedForAttachDelete := not entry.MarkedForAttachDelete;
+    item.Caption := AttachDeleteMarkText(entry.MarkedForAttachDelete);
+  end
+  else if colIndex = protectColIndex then begin
     entry.IsProtected := not entry.IsProtected;
     SetUIDProtected(entry.UID, entry.IsProtected);
-    item.Caption := ProtectMarkText(entry.IsProtected); // 保護列はCaption（列0）
+    item.SubItems[protectColIndex - 1] := ProtectMarkText(entry.IsProtected);
     if entry.IsProtected then begin
-      // 保護したら、念のため両方のチェックを外す
-      item.Checked := False;
+      // 保護したら、念のため他のチェックも外す
+      entry.MarkedForAttachDelete := False;
+      item.Caption := AttachDeleteMarkText(False);
       entry.MarkedForDelete := False;
       item.SubItems[deleteMailColIndex - 1] := DeleteMailMarkText(False);
     end;
@@ -2442,6 +2549,8 @@ var
   displayList: TList<TMailEntry>;
   protIDs: TDictionary<Int64, Boolean>;
 begin
+  if not TryBeginNetworkOp then Exit;
+  try
   try
     EnsureConnected;
     ClearEntries;
@@ -2480,7 +2589,7 @@ begin
       try
         // ENVELOPE（件名・差出人・日付）とBODYSTRUCTURE（添付のファイル名・サイズ等）を
         // UID範囲まとめて1回のFETCHコマンドで取得する。添付の中身は一切ダウンロードしない。
-        // 実際に本文まるごと取得するのは、更新でチェックしたメールだけ（DoUpdateClick側）。
+        // 実際に本文まるごと取得するのは、更新でチェックしたメールだけ（DoProcessSelectedClick側）。
         while (chunkFromUID <= highestUID) and (foundCount < targetCount) do begin
           chunkToUID := chunkFromUID + ListChunkSize - 1;
           if chunkToUID > highestUID then chunkToUID := highestUID;
@@ -2573,17 +2682,17 @@ begin
             entry.IsProtected := protIDs.ContainsKey(entry.UID);
 
             item := lvMails.Items.Add;
-            // 列順: 保護, メール削除, 日付, 差出人, 件名, 添付数, 添付合計サイズ
-            item.Caption := ProtectMarkText(entry.IsProtected);
+            // 列順: 添付削除, メール削除, 保護, 日付, 差出人, 件名, 添付数, 添付合計サイズ
+            // 誤操作防止のため、初期状態はどれも未チェック（ユーザーが選んでからチェックする）
+            item.Caption := AttachDeleteMarkText(entry.MarkedForAttachDelete);
             item.SubItems.Add(DeleteMailMarkText(entry.MarkedForDelete));
+            item.SubItems.Add(ProtectMarkText(entry.IsProtected));
             item.SubItems.Add(entry.DateStr);
             item.SubItems.Add(entry.From);
             item.SubItems.Add(entry.Subject);
             item.SubItems.Add(IntToStr(entry.AttachCount));
             item.SubItems.Add(Format('%.1f KB', [entry.AttachTotalSize / 1024]));
             item.Data := entry;
-            // 誤操作防止のため、初期状態はチェックなし（ユーザーが選んでからチェックする）
-            item.Checked := False;
           end;
         finally
           lvMails.Items.EndUpdate;
@@ -2599,17 +2708,19 @@ begin
     end;
 
     // 一覧取得のたびに、添付合計サイズが大きい順に並べ替える
-    FSortColumn := 6;
+    FSortColumn := 7;
     FSortAscending := False;
     lvMails.CustomSort(nil, FSortColumn);
 
     btnUpdate.Enabled := lvMails.Items.Count > 0;
-    btnDeleteMails.Enabled := lvMails.Items.Count > 0;
   except
     on E: Exception do begin
       Log(Format(T('msg.listError'), [E.Message]));
       ShowMessage(Format(T('msg.listFailed'), [E.Message]));
     end;
+  end;
+  finally
+    EndNetworkOp;
   end;
 end;
 
@@ -2716,50 +2827,260 @@ begin
   Result := removed;
 end;
 
-{ IMAP通信部分（対象メールの取得・退避・置き換え）はすべてバックグラウンドスレッドで
-  行い、メイン画面をブロックしないようにする。確認ダイアログ・対象選定のみメイン
-  スレッドで同期的に行う。 }
-procedure TForm1.DoUpdateClick(Sender: TObject);
+{ 「添付削除」列にチェックが付いているメールの添付ファイルを取り除く処理の本体。
+  AImapは呼び出し元が接続・SelectMailBox済みのものを渡す（バックグラウンドスレッド
+  から呼ばれる想定。Log/UpdateProgress等は内部で自動的にメインスレッドへrouteする）。 }
+procedure TForm1.ProcessAttachDeleteTargets(AImap: TIdIMAP4Batch; ATargets: TList<TMailEntry>;
+  const ADeleteFolder: string; AIsGmail, AIsSpecialUseFolder, AAutoVerify: Boolean;
+  out ATotalMails, ATotalRemoved: Integer);
+var
+  entry: TMailEntry;
+  entryUID: Int64;
+  entrySubject: string;
+  removedCount, doneCount: Integer;
+  copiedOriginal, usedLabelMove: Boolean;
+begin
+  ATotalMails := 0;
+  ATotalRemoved := 0;
+  doneCount := 0;
+  for entry in ATargets do begin
+    entryUID := entry.UID; // entryはこの後の処理成功時にFEntriesから削除(=解放)されるため先に控えておく
+    entrySubject := entry.Subject;
+    Inc(doneCount);
+    UpdateProgress(doneCount, ATargets.Count,
+      Format(T('msg.updateProgress'), [doneCount, ATargets.Count, entryUID]));
+    try
+      copiedOriginal := True;
+      usedLabelMove := False;
+
+      // 【重要】退避（コピー/ラベル操作）より先に、必ず本文をまるごと
+      // ダウンロードしておく。Gmailでは移動先が「ゴミ箱」等の特殊フォルダの
+      // 場合、コピー/ラベル追加した時点でGmail側がその場で元メールを
+      // INBOXから外してしまうことがある（ゴミ箱は他のラベルと共存しない
+      // 扱いのため）。退避を先にやると、そのせいでUIDが無効になり、
+      // 直後の本文取得が失敗してしまう。本文取得を必ず先に行うことで、
+      // 退避先がどんな特殊フォルダであっても影響を受けないようにする。
+      entry.Msg := TIdMessage.Create(nil);
+      // UIDRetrieve(非Peek)はRFC822形式でのFETCHとなり、Gmail相手だと応答の
+      // パース失敗でOKなのにFalseが返ることがあったため、より安定するBODY.PEEK[]
+      // 形式のUIDRetrievePeekを使う（どうせ直後に元メールは退避/削除するので
+      // \Seenが変化しないことは問題にならない）。
+      if not AImap.UIDRetrievePeek(IntToStr(entryUID), entry.Msg) then begin
+        // 取得失敗の原因が「パース不具合」か「そもそも既に存在しない
+        // （前回の実行で処理済み等でキャッシュが古いまま）」かを軽量チェックで
+        // 見分ける。既に存在しないなら、キャッシュ/一覧からも取り除いて次回
+        // またここで無駄に足止めされないようにする。
+        if AImap.UIDExists(IntToStr(entryUID)) then
+          Log(Format(T('msg.bodyFetchFailed'),
+            [entryUID, AImap.GetLastReplyText]))
+        else begin
+          Log(Format(T('msg.bodyGoneRemovedCache'), [entryUID]));
+          MarkEntryProcessed(entry);
+        end;
+        Continue;
+      end;
+
+      if not StripAttachmentsFromMessage(entry.Msg, removedCount) then begin
+        Log(Format(T('msg.noAttachmentSkip'), [entryUID]));
+        Continue;
+      end;
+
+      // 添付を抜いたメッセージを同じフォルダへ追加登録
+      // （本文はすでに手元にあるので、これ以降は元メールのUIDが
+      //   無効になっても問題ない）
+      // \Seenを付け、かつ元メールと同じ日時(INTERNALDATE)で追加する。
+      // どちらもしないと「今日届いた新着未読メール」のように見えてしまい、
+      // 処理する度に新規メールが届いたかのような通知が出てしまうため。
+      if not AImap.AppendMsgWithDate(FolderName, entry.Msg, [mfSeen], entry.Msg.Date) then begin
+        Log(Format(T('msg.appendFailed'), [entryUID]));
+        Continue;
+      end;
+
+      // 添付なし版の再登録に成功したので、ここで初めて元メール（添付あり）を退避する。
+      if ADeleteFolder <> '' then begin
+        if AIsGmail and (not AIsSpecialUseFolder) then begin
+          usedLabelMove := True;
+          copiedOriginal := AImap.GmailAddLabel(entryUID, ADeleteFolder);
+        end
+        else
+          copiedOriginal := AImap.UIDCopyMsg(IntToStr(entryUID), ADeleteFolder);
+
+        if not copiedOriginal then
+          Log(Format(T('msg.preserveFailed'),
+            [entryUID, ADeleteFolder]));
+      end
+      else
+        copiedOriginal := True; // 移動先未設定＝完全削除でよい
+
+      // 退避（またはコピー不要）に成功した場合のみ、元メールを対象フォルダから外す。
+      // Gmailでラベル退避した場合は、ここで元フォルダのラベルを外すだけで完結
+      // （\Deleted+EXPUNGEを一切使わないため、ゴミ箱へ落ちる事故が起きない）。
+      // それ以外は従来どおり削除フラグを立て、後でまとめてExpungeする。
+      if copiedOriginal then begin
+        if usedLabelMove then
+          AImap.GmailRemoveLabel(entryUID, FolderName)
+        else
+          AImap.UIDDeleteMsg(IntToStr(entryUID));
+      end;
+
+      Inc(ATotalMails);
+      ATotalRemoved := ATotalRemoved + removedCount;
+      if not copiedOriginal then
+        Log(Format(T('msg.preserveFailedKept'),
+          [entryUID, ADeleteFolder]))
+      else if ADeleteFolder <> '' then
+        Log(Format(T('msg.removedMoved'),
+          [entryUID, removedCount, ADeleteFolder]))
+      else
+        Log(Format(T('msg.removedNoMove'), [entryUID, removedCount]));
+
+      // 処理済み（元メールの退避まで完了した分）は、次回のキャッシュには含めない
+      // （再スキャン時に重複して出てこないように）。ただし今表示している一覧
+      // からは消さない＝FEntriesからは抜くがオブジェクトは解放せず保持し続け、
+      // ユーザーがその場で結果を見比べられるようにする。
+      // （FEntries/lvMailsの更新はメインスレッドへ同期して行う）
+      if copiedOriginal then
+        MarkEntryProcessed(entry);
+
+      // 自動検証: 実際に元フォルダ・移動先フォルダへ正しく反映されたかをその場で確認する。
+      // 件名が長い/特殊文字を含むメールでは、サーバーが応答をIMAPの
+      // リテラル形式で送ってきた際に自前パーサーが行数を誤判定し、
+      // 応答が来ているのに待ち続けてしまうことがある（60秒×数回で
+      // 数分単位の停止になる）。検証中だけタイムアウトを短くして被害を
+      // 抑えつつ、一度失敗したUIDはファイルに記録して次回以降スキップする。
+      if not AAutoVerify then begin
+        // チェックボックスでOFFにされている場合は検証自体を行わない
+      end
+      else if not IsUIDInVerifySkipList(entryUID) then begin
+        if Assigned(AImap.IOHandler) then
+          AImap.IOHandler.ReadTimeout := 30000;
+        try
+          try
+            Log(T('msg.verifyHeader'));
+            VerifySubjectInFolder(FolderName, entrySubject);
+            if (ADeleteFolder <> '') and not SameText(ADeleteFolder, FolderName) then
+              VerifySubjectInFolder(ADeleteFolder, entrySubject);
+          except
+            on E: Exception do begin
+              Log(Format(T('msg.verifySkipAdded'), [entryUID, E.Message]));
+              AddUIDToVerifySkipList(entryUID);
+              ClearIOBuffer;
+            end;
+          end;
+        finally
+          if Assigned(AImap.IOHandler) then
+            AImap.IOHandler.ReadTimeout := 60000;
+          // 検証で選択フォルダが変わるため、次のメールの処理のために戻しておく
+          AImap.SelectMailBox(FolderName);
+        end;
+      end
+      else
+        Log(Format(T('msg.verifySkipped'), [entryUID]));
+    except
+      on E: Exception do begin
+        Log(Format(T('msg.processError'), [entryUID, E.Message]));
+        ClearIOBuffer;
+      end;
+    end;
+  end;
+end;
+
+{ 「メール削除」列にチェックが付いているメールを、丸ごと移動先フォルダへ退避
+  （またはADeleteFolder=''なら完全削除）する処理の本体。添付は残したまま処理する点が
+  「添付削除」との違い。AImapは呼び出し元が接続・SelectMailBox済みのものを渡す。 }
+procedure TForm1.ProcessMailDeleteTargets(AImap: TIdIMAP4Batch; ATargets: TList<TMailEntry>;
+  const ADeleteFolder: string; AIsGmail, AIsSpecialUseFolder: Boolean; out ATotalDeleted: Integer);
+var
+  entry: TMailEntry;
+  entryUID: Int64;
+  doneCount: Integer;
+  ok: Boolean;
+begin
+  ATotalDeleted := 0;
+  doneCount := 0;
+  for entry in ATargets do begin
+    entryUID := entry.UID;
+    Inc(doneCount);
+    UpdateProgress(doneCount, ATargets.Count,
+      Format(T('msg.deleteMailsProgress'), [doneCount, ATargets.Count, entryUID]));
+    try
+      ok := MoveOrDeleteOriginal(entryUID, ADeleteFolder, AIsGmail, AIsSpecialUseFolder);
+      if not ok then
+        Log(Format(T('msg.preserveFailed'), [entryUID, ADeleteFolder]))
+      else begin
+        Inc(ATotalDeleted);
+        if ADeleteFolder <> '' then
+          Log(Format(T('msg.mailMoved'), [entryUID, ADeleteFolder]))
+        else
+          Log(Format(T('msg.mailDeleted'), [entryUID]));
+        RemoveEntryFromList(entry);
+      end;
+    except
+      on E: Exception do begin
+        Log(Format(T('msg.processError'), [entryUID, E.Message]));
+        ClearIOBuffer;
+      end;
+    end;
+  end;
+end;
+
+{ 「添付削除」列・「メール削除」列、両方にチェックが付いたメールをまとめて1回で
+  処理する統合ボタン。同じメールが両方にチェックされている場合は「メール削除」を
+  優先する（メールごと消えるなら添付だけ抜く意味が無いため）。
+  IMAP通信部分はすべてバックグラウンドスレッドで行い、メイン画面をブロックしない。
+  確認ダイアログ・対象選定のみメインスレッドで同期的に行う。 }
+procedure TForm1.DoProcessSelectedClick(Sender: TObject);
 var
   i: Integer;
   entry: TMailEntry;
-  targets: TList<TMailEntry>;
+  attachTargets, mailTargets: TList<TMailEntry>;
   confirmMsg: string;
   deleteFolder: string;
+  autoVerify: Boolean;
   th: TThread;
 begin
-  targets := TList<TMailEntry>.Create;
+  attachTargets := TList<TMailEntry>.Create;
+  mailTargets := TList<TMailEntry>.Create;
   for i := 0 to lvMails.Items.Count - 1 do begin
-    if lvMails.Items[i].Checked then begin
-      entry := TMailEntry(lvMails.Items[i].Data);
-      // 保護指定されているメールは、チェックが付いていても対象から除外する
-      // （保護列のクリックでチェックを外し忘れた場合の保険）
-      if (entry.AttachCount > 0) and (not entry.IsProtected) then
-        targets.Add(entry);
-    end;
+    entry := TMailEntry(lvMails.Items[i].Data);
+    if (not Assigned(entry)) or entry.IsProtected then Continue;
+    if entry.MarkedForDelete then
+      mailTargets.Add(entry)
+    else if entry.MarkedForAttachDelete and (entry.AttachCount > 0) then
+      attachTargets.Add(entry);
   end;
 
-  if targets.Count = 0 then begin
+  if (attachTargets.Count = 0) and (mailTargets.Count = 0) then begin
     ShowMessage(T('msg.noTargets'));
-    targets.Free;
+    attachTargets.Free;
+    mailTargets.Free;
     Exit;
   end;
 
-  if not ConfirmBulkWarningIfNeeded(targets.Count) then begin
-    targets.Free;
+  if not ConfirmBulkWarningIfNeeded(attachTargets.Count + mailTargets.Count) then begin
+    attachTargets.Free;
+    mailTargets.Free;
     Exit;
   end;
 
   deleteFolder := DeleteFolderName;
-
   if deleteFolder <> '' then
-    confirmMsg := Format(T('msg.updateConfirmMove'), [targets.Count, deleteFolder])
+    confirmMsg := Format(T('msg.processConfirmMove'), [attachTargets.Count, mailTargets.Count, deleteFolder])
   else
-    confirmMsg := Format(T('msg.updateConfirmNoMove'), [targets.Count]);
+    confirmMsg := Format(T('msg.processConfirmNoMove'), [attachTargets.Count, mailTargets.Count]);
   if MessageDlg(confirmMsg, mtWarning, [mbYes, mbNo], 0) <> mrYes then begin
-    targets.Free;
+    attachTargets.Free;
+    mailTargets.Free;
     Exit;
   end;
+
+  if not TryBeginNetworkOp then begin
+    attachTargets.Free;
+    mailTargets.Free;
+    Exit;
+  end;
+
+  autoVerify := chkAutoVerify.Checked;
 
   Screen.Cursor := crHourGlass;
   btnUpdate.Enabled := False;
@@ -2768,17 +3089,15 @@ begin
   th := TThread.CreateAnonymousThread(
     procedure
     var
-      entry: TMailEntry;
-      entryUID: Int64;
-      entrySubject: string;
-      removedCount, totalRemoved, totalMails, doneCount: Integer;
       imap: TIdIMAP4Batch;
-      copiedOriginal, isGmail, isSpecialUseFolder, usedLabelMove: Boolean;
+      isGmail, isSpecialUseFolder: Boolean;
+      totalAttachMails, totalRemoved, totalDeletedMails: Integer;
       errMsg: string;
     begin
       errMsg := '';
+      totalAttachMails := 0;
       totalRemoved := 0;
-      totalMails := 0;
+      totalDeletedMails := 0;
       try
         try
           EnsureConnected;
@@ -2821,152 +3140,20 @@ begin
               Log(Format(T('msg.gmailSpecialFolder'), [deleteFolder]));
           end;
 
-          doneCount := 0;
-          for entry in targets do begin
-            entryUID := entry.UID; // entryはこの後の処理成功時にFEntriesから削除(=解放)されるため先に控えておく
-            entrySubject := entry.Subject;
-            Inc(doneCount);
-            UpdateProgress(doneCount, targets.Count,
-              Format(T('msg.updateProgress'), [doneCount, targets.Count, entryUID]));
-            try
-              copiedOriginal := True;
-              usedLabelMove := False;
+          if attachTargets.Count > 0 then
+            ProcessAttachDeleteTargets(imap, attachTargets, deleteFolder,
+              isGmail, isSpecialUseFolder, autoVerify, totalAttachMails, totalRemoved);
 
-              // 【重要】退避（コピー/ラベル操作）より先に、必ず本文をまるごと
-              // ダウンロードしておく。Gmailでは移動先が「ゴミ箱」等の特殊フォルダの
-              // 場合、コピー/ラベル追加した時点でGmail側がその場で元メールを
-              // INBOXから外してしまうことがある（ゴミ箱は他のラベルと共存しない
-              // 扱いのため）。退避を先にやると、そのせいでUIDが無効になり、
-              // 直後の本文取得が失敗してしまう。本文取得を必ず先に行うことで、
-              // 退避先がどんな特殊フォルダであっても影響を受けないようにする。
-              entry.Msg := TIdMessage.Create(nil);
-              // UIDRetrieve(非Peek)はRFC822形式でのFETCHとなり、Gmail相手だと応答の
-              // パース失敗でOKなのにFalseが返ることがあったため、より安定するBODY.PEEK[]
-              // 形式のUIDRetrievePeekを使う（どうせ直後に元メールは退避/削除するので
-              // \Seenが変化しないことは問題にならない）。
-              if not imap.UIDRetrievePeek(IntToStr(entryUID), entry.Msg) then begin
-                // 取得失敗の原因が「パース不具合」か「そもそも既に存在しない
-                // （前回の実行で処理済み等でキャッシュが古いまま）」かを軽量チェックで
-                // 見分ける。既に存在しないなら、キャッシュ/一覧からも取り除いて次回
-                // またここで無駄に足止めされないようにする。
-                if imap.UIDExists(IntToStr(entryUID)) then
-                  Log(Format(T('msg.bodyFetchFailed'),
-                    [entryUID, imap.GetLastReplyText]))
-                else begin
-                  Log(Format(T('msg.bodyGoneRemovedCache'), [entryUID]));
-                  MarkEntryProcessed(entry);
-                end;
-                Continue;
-              end;
-
-              if not StripAttachmentsFromMessage(entry.Msg, removedCount) then begin
-                Log(Format(T('msg.noAttachmentSkip'), [entryUID]));
-                Continue;
-              end;
-
-              // 添付を抜いたメッセージを同じフォルダへ追加登録
-              // （本文はすでに手元にあるので、これ以降は元メールのUIDが
-              //   無効になっても問題ない）
-              // \Seenを付け、かつ元メールと同じ日時(INTERNALDATE)で追加する。
-              // どちらもしないと「今日届いた新着未読メール」のように見えてしまい、
-              // 処理する度に新規メールが届いたかのような通知が出てしまうため。
-              if not imap.AppendMsgWithDate(FolderName, entry.Msg, [mfSeen], entry.Msg.Date) then begin
-                Log(Format(T('msg.appendFailed'), [entryUID]));
-                Continue;
-              end;
-
-              // 添付なし版の再登録に成功したので、ここで初めて元メール（添付あり）を退避する。
-              if deleteFolder <> '' then begin
-                if isGmail and (not isSpecialUseFolder) then begin
-                  usedLabelMove := True;
-                  copiedOriginal := imap.GmailAddLabel(entryUID, deleteFolder);
-                end
-                else
-                  copiedOriginal := imap.UIDCopyMsg(IntToStr(entryUID), deleteFolder);
-
-                if not copiedOriginal then
-                  Log(Format(T('msg.preserveFailed'),
-                    [entryUID, deleteFolder]));
-              end
-              else
-                copiedOriginal := True; // 移動先未設定＝完全削除でよい
-
-              // 退避（またはコピー不要）に成功した場合のみ、元メールを対象フォルダから外す。
-              // Gmailでラベル退避した場合は、ここで元フォルダのラベルを外すだけで完結
-              // （\Deleted+EXPUNGEを一切使わないため、ゴミ箱へ落ちる事故が起きない）。
-              // それ以外は従来どおり削除フラグを立て、後でまとめてExpungeする。
-              if copiedOriginal then begin
-                if usedLabelMove then
-                  imap.GmailRemoveLabel(entryUID, FolderName)
-                else
-                  imap.UIDDeleteMsg(IntToStr(entryUID));
-              end;
-
-              Inc(totalMails);
-              totalRemoved := totalRemoved + removedCount;
-              if not copiedOriginal then
-                Log(Format(T('msg.preserveFailedKept'),
-                  [entryUID, deleteFolder]))
-              else if deleteFolder <> '' then
-                Log(Format(T('msg.removedMoved'),
-                  [entryUID, removedCount, deleteFolder]))
-              else
-                Log(Format(T('msg.removedNoMove'), [entryUID, removedCount]));
-
-              // 処理済み（元メールの退避まで完了した分）は、次回のキャッシュには含めない
-              // （再スキャン時に重複して出てこないように）。ただし今表示している一覧
-              // からは消さない＝FEntriesからは抜くがオブジェクトは解放せず保持し続け、
-              // ユーザーがその場で結果を見比べられるようにする。
-              // （FEntries/lvMailsの更新はメインスレッドへ同期して行う）
-              if copiedOriginal then
-                MarkEntryProcessed(entry);
-
-              // 自動検証: 実際に元フォルダ・移動先フォルダへ正しく反映されたかをその場で確認する。
-              // 件名が長い/特殊文字を含むメールでは、サーバーが応答をIMAPの
-              // リテラル形式で送ってきた際に自前パーサーが行数を誤判定し、
-              // 応答が来ているのに待ち続けてしまうことがある（60秒×数回で
-              // 数分単位の停止になる）。検証中だけタイムアウトを短くして被害を
-              // 抑えつつ、一度失敗したUIDはファイルに記録して次回以降スキップする。
-              if not IsUIDInVerifySkipList(entryUID) then begin
-                if Assigned(imap.IOHandler) then
-                  imap.IOHandler.ReadTimeout := 30000;
-                try
-                  try
-                    Log(T('msg.verifyHeader'));
-                    VerifySubjectInFolder(FolderName, entrySubject);
-                    if (deleteFolder <> '') and not SameText(deleteFolder, FolderName) then
-                      VerifySubjectInFolder(deleteFolder, entrySubject);
-                  except
-                    on E: Exception do begin
-                      Log(Format(T('msg.verifySkipAdded'), [entryUID, E.Message]));
-                      AddUIDToVerifySkipList(entryUID);
-                      ClearIOBuffer;
-                    end;
-                  end;
-                finally
-                  if Assigned(imap.IOHandler) then
-                    imap.IOHandler.ReadTimeout := 60000;
-                  // 検証で選択フォルダが変わるため、次のメールの処理のために戻しておく
-                  imap.SelectMailBox(FolderName);
-                end;
-              end
-              else
-                Log(Format(T('msg.verifySkipped'), [entryUID]));
-            except
-              on E: Exception do begin
-                Log(Format(T('msg.processError'), [entryUID, E.Message]));
-                ClearIOBuffer;
-              end;
-            end;
-          end;
+          if mailTargets.Count > 0 then
+            ProcessMailDeleteTargets(imap, mailTargets, deleteFolder,
+              isGmail, isSpecialUseFolder, totalDeletedMails);
 
           // 処理結果（キャッシュから取り除いた分）をファイルへ反映する
           SaveScanCache(PeekLastScannedUID);
 
-          if totalMails > 0 then begin
+          if (totalAttachMails > 0) or (totalDeletedMails > 0) then begin
             Log(T('msg.expunging'));
             imap.ExpungeMailBox;
-            Log(Format(T('msg.updateDone'), [totalMails, totalRemoved]));
           end
           else
             Log(T('msg.noProcessed'));
@@ -2984,140 +3171,17 @@ begin
             ResetProgress;
             btnUpdate.Enabled := True;
             btnList.Enabled := True;
-            targets.Free;
+            EndNetworkOp;
+            attachTargets.Free;
+            mailTargets.Free;
 
             if errMsg <> '' then
               ShowMessage(Format(T('msg.updateFailedBox'), [errMsg]))
-            else if totalMails > 0 then
-              ShowMessage(Format(T('msg.updateDoneBox'), [totalMails, totalRemoved]));
+            else if (totalAttachMails > 0) or (totalDeletedMails > 0) then
+              ShowMessage(Format(T('msg.processDoneBox'), [totalAttachMails, totalRemoved, totalDeletedMails]));
             // 一覧は自動更新しない（処理済みの行を[済]表示のまま残し、その場で
             // 結果を見比べられるようにするため）。最新の状態を見たい場合は
             // 「一覧取得」を手動で押してもらう。
-          end);
-      end;
-    end);
-  th.FreeOnTerminate := True;
-  th.Start;
-end;
-
-{ 「メール削除」列にチェックが付いているメールを、丸ごと移動先フォルダへ退避
-  （またはDeleteFolderName=''なら完全削除）する。添付は残したまま処理する点が
-  「4. 選択した添付を削除」との違い。IMAP通信はバックグラウンドスレッドで行う。 }
-procedure TForm1.DoDeleteMailsClick(Sender: TObject);
-var
-  i: Integer;
-  entry: TMailEntry;
-  targets: TList<TMailEntry>;
-  confirmMsg: string;
-  deleteFolder: string;
-  th: TThread;
-begin
-  targets := TList<TMailEntry>.Create;
-  for i := 0 to lvMails.Items.Count - 1 do begin
-    entry := TMailEntry(lvMails.Items[i].Data);
-    if Assigned(entry) and entry.MarkedForDelete and (not entry.IsProtected) then
-      targets.Add(entry);
-  end;
-
-  if targets.Count = 0 then begin
-    ShowMessage(T('msg.noDeleteMailTargets'));
-    targets.Free;
-    Exit;
-  end;
-
-  if not ConfirmBulkWarningIfNeeded(targets.Count) then begin
-    targets.Free;
-    Exit;
-  end;
-
-  deleteFolder := DeleteFolderName;
-  if deleteFolder <> '' then
-    confirmMsg := Format(T('msg.deleteMailsConfirmMove'), [targets.Count, deleteFolder])
-  else
-    confirmMsg := Format(T('msg.deleteMailsConfirmNoMove'), [targets.Count]);
-  if MessageDlg(confirmMsg, mtWarning, [mbYes, mbNo], 0) <> mrYes then begin
-    targets.Free;
-    Exit;
-  end;
-
-  Screen.Cursor := crHourGlass;
-  btnUpdate.Enabled := False;
-  btnList.Enabled := False;
-  btnDeleteMails.Enabled := False;
-
-  th := TThread.CreateAnonymousThread(
-    procedure
-    var
-      entry: TMailEntry;
-      entryUID: Int64;
-      doneCount, totalDeleted: Integer;
-      imap: TIdIMAP4Batch;
-      isGmail, isSpecialUseFolder, ok: Boolean;
-      errMsg: string;
-    begin
-      errMsg := '';
-      totalDeleted := 0;
-      try
-        try
-          EnsureConnected;
-          imap := FIMAP4;
-          if not imap.SelectMailBox(FolderName) then
-            raise Exception.Create(T('msg.folderSelectFailed'));
-
-          PrepareDeleteFolder(deleteFolder, isGmail, isSpecialUseFolder);
-
-          doneCount := 0;
-          for entry in targets do begin
-            entryUID := entry.UID;
-            Inc(doneCount);
-            UpdateProgress(doneCount, targets.Count,
-              Format(T('msg.deleteMailsProgress'), [doneCount, targets.Count, entryUID]));
-            try
-              ok := MoveOrDeleteOriginal(entryUID, deleteFolder, isGmail, isSpecialUseFolder);
-              if not ok then
-                Log(Format(T('msg.preserveFailed'), [entryUID, deleteFolder]))
-              else begin
-                Inc(totalDeleted);
-                if deleteFolder <> '' then
-                  Log(Format(T('msg.mailMoved'), [entryUID, deleteFolder]))
-                else
-                  Log(Format(T('msg.mailDeleted'), [entryUID]));
-                RemoveEntryFromList(entry);
-              end;
-            except
-              on E: Exception do begin
-                Log(Format(T('msg.processError'), [entryUID, E.Message]));
-                ClearIOBuffer;
-              end;
-            end;
-          end;
-
-          SaveScanCache(PeekLastScannedUID);
-          if totalDeleted > 0 then begin
-            Log(T('msg.expunging'));
-            imap.ExpungeMailBox;
-          end;
-        except
-          on E: Exception do begin
-            Log(Format(T('msg.updateError'), [E.Message]));
-            errMsg := E.Message;
-          end;
-        end;
-      finally
-        RunOnMainThread(
-          procedure
-          begin
-            Screen.Cursor := crDefault;
-            ResetProgress;
-            btnUpdate.Enabled := True;
-            btnList.Enabled := True;
-            btnDeleteMails.Enabled := True;
-            targets.Free;
-
-            if errMsg <> '' then
-              ShowMessage(Format(T('msg.updateFailedBox'), [errMsg]))
-            else if totalDeleted > 0 then
-              ShowMessage(Format(T('msg.deleteMailsDoneBox'), [totalDeleted]));
           end);
       end;
     end);

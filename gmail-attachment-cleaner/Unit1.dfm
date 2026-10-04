@@ -209,6 +209,17 @@ object Form1: TForm1
       TabOrder = 15
       OnClick = DoAutoListClick
     end
+    object chkAutoVerify: TCheckBox
+      Left = 20
+      Top = 530
+      Width = 290
+      Height = 17
+      Caption = 'Auto-verify after each removal'
+      Checked = True
+      State = cbChecked
+      TabOrder = 16
+      OnClick = DoAutoVerifyClick
+    end
   end
   object pList: TPanel
     Left = 321
@@ -233,14 +244,18 @@ object Form1: TForm1
       Width = 937
       Height = 428
       Align = alClient
-      Checkboxes = True
       Columns = <
         item
-          Caption = #20445#35703
+          Caption = #28155#20184#21066#38500
+          Width = 70
         end
         item
           Caption = #12513#12540#12523#21066#38500
           Width = 70
+        end
+        item
+          Caption = #20445#35703
+          Width = 50
         end
         item
           Caption = #26085#20184
@@ -300,12 +315,12 @@ object Form1: TForm1
       object btnUpdate: TButton
         Left = 510
         Top = 7
-        Width = 168
+        Width = 306
         Height = 33
-        Caption = '4. '#36984#25246#12375#12383#28155#20184#12434#21066#38500
+        Caption = '4. '#36984#25246#12375#12383#39033#30446#12434#21762#29702
         Enabled = False
         TabOrder = 1
-        OnClick = DoUpdateClick
+        OnClick = DoProcessSelectedClick
       end
       object pbProgress: TProgressBar
         Left = 117
@@ -322,16 +337,6 @@ object Form1: TForm1
         Caption = #26908#32034#12461#12515#12483#12471#12517#12434#12463#12522#12450
         TabOrder = 3
         OnClick = DoClearCacheClick
-      end
-      object btnDeleteMails: TButton
-        Left = 686
-        Top = 7
-        Width = 130
-        Height = 33
-        Caption = '5. '#36984#25246#12375#12383#12513#12540#12523#12434#21066#38500
-        Enabled = False
-        TabOrder = 4
-        OnClick = DoDeleteMailsClick
       end
     end
   end
